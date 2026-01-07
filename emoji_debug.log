@@ -1,0 +1,107 @@
+[2025-12-24 21:42:44] Creating new EmojiResolver
+[2025-12-24 21:42:44] ExtractTextWithCustomEmojiResolved called
+[2025-12-24 21:42:44]   Input text: "🍀" (len=4, bytes=[240 159 141 128])
+[2025-12-24 21:42:44]   Entities count: 1
+[2025-12-24 21:42:44]   Entity[0]: CustomEmoji offset=0 len=2 docID=5206673438579651963
+[2025-12-24 21:42:44] Resolving 1 document IDs: [5206673438579651963]
+[2025-12-24 21:42:44] Fetching 1 emoji from API: [5206673438579651963]
+[2025-12-24 21:42:44] Got 1 documents from API
+[2025-12-24 21:42:44] Processing document ID 5206673438579651963
+[2025-12-24 21:42:44]   Attributes count: 3
+[2025-12-24 21:42:44]   Attr[0]: *tg.DocumentAttributeImageSize
+[2025-12-24 21:42:44]   Attr[1]: *tg.DocumentAttributeCustomEmoji
+[2025-12-24 21:42:44]     CustomEmoji.Alt: "🍀" (len=4, bytes=[240 159 141 128])
+[2025-12-24 21:42:44]     CustomEmoji.Free: false
+[2025-12-24 21:42:44]     CustomEmoji.TextColor: true
+[2025-12-24 21:42:44]   Attr[2]: *tg.DocumentAttributeFilename
+[2025-12-24 21:42:44]   Extracted emoji: "🍀" (len=4, bytes=[240 159 141 128])
+[2025-12-24 21:42:44] Final result: map[5206673438579651963:🍀]
+[2025-12-24 21:42:44]   Replacement: offset 0-2 (runes 0-1) -> "🍀"
+[2025-12-24 21:42:44]   Original runes: [127808]
+[2025-12-24 21:42:44]   After replacements runes: [127808]
+[2025-12-24 21:42:44]   Final result: "🍀" (bytes=[240 159 141 128])
+[2025-12-24 21:42:44] ExtractTextWithCustomEmojiResolved called
+[2025-12-24 21:42:44]   Input text: "👤" (len=4, bytes=[240 159 145 164])
+[2025-12-24 21:42:44]   Entities count: 1
+[2025-12-24 21:42:44]   Entity[0]: CustomEmoji offset=0 len=2 docID=5258011929993026890
+[2025-12-24 21:42:44] Resolving 1 document IDs: [5258011929993026890]
+[2025-12-24 21:42:44] Fetching 1 emoji from API: [5258011929993026890]
+[2025-12-24 21:42:44] Got 1 documents from API
+[2025-12-24 21:42:44] Processing document ID 5258011929993026890
+[2025-12-24 21:42:44]   Attributes count: 3
+[2025-12-24 21:42:44]   Attr[0]: *tg.DocumentAttributeImageSize
+[2025-12-24 21:42:44]   Attr[1]: *tg.DocumentAttributeCustomEmoji
+[2025-12-24 21:42:44]     CustomEmoji.Alt: "👤" (len=4, bytes=[240 159 145 164])
+[2025-12-24 21:42:44]     CustomEmoji.Free: false
+[2025-12-24 21:42:44]     CustomEmoji.TextColor: true
+[2025-12-24 21:42:44]   Attr[2]: *tg.DocumentAttributeFilename
+[2025-12-24 21:42:44]   Extracted emoji: "👤" (len=4, bytes=[240 159 145 164])
+[2025-12-24 21:42:44] Final result: map[5258011929993026890:👤]
+[2025-12-24 21:42:44]   Replacement: offset 0-2 (runes 0-1) -> "👤"
+[2025-12-24 21:42:44]   Original runes: [128100]
+[2025-12-24 21:42:44]   After replacements runes: [128100]
+[2025-12-24 21:42:44]   Final result: "👤" (bytes=[240 159 145 164])
+[2025-12-24 21:42:44] ExtractTextWithCustomEmojiResolved called
+[2025-12-24 21:42:44]   Input text: "⭐️👥" (len=10, bytes=[226 173 144 239 184 143 240 159 145 165])
+[2025-12-24 21:42:44]   Entities count: 2
+[2025-12-24 21:42:44]   Entity[0]: CustomEmoji offset=0 len=2 docID=5258185631355378853
+[2025-12-24 21:42:44]   Entity[1]: CustomEmoji offset=2 len=2 docID=5258513401784573443
+[2025-12-24 21:42:44] Resolving 2 document IDs: [5258185631355378853 5258513401784573443]
+[2025-12-24 21:42:44] Fetching 2 emoji from API: [5258185631355378853 5258513401784573443]
+[2025-12-24 21:42:44] Got 2 documents from API
+[2025-12-24 21:42:44] Processing document ID 5258185631355378853
+[2025-12-24 21:42:44]   Attributes count: 3
+[2025-12-24 21:42:44]   Attr[0]: *tg.DocumentAttributeImageSize
+[2025-12-24 21:42:44]   Attr[1]: *tg.DocumentAttributeCustomEmoji
+[2025-12-24 21:42:44]     CustomEmoji.Alt: "⭐️" (len=6, bytes=[226 173 144 239 184 143])
+[2025-12-24 21:42:44]     CustomEmoji.Free: false
+[2025-12-24 21:42:44]     CustomEmoji.TextColor: true
+[2025-12-24 21:42:44]   Attr[2]: *tg.DocumentAttributeFilename
+[2025-12-24 21:42:44]   Extracted emoji: "⭐️" (len=6, bytes=[226 173 144 239 184 143])
+[2025-12-24 21:42:44] Processing document ID 5258513401784573443
+[2025-12-24 21:42:44]   Attributes count: 3
+[2025-12-24 21:42:44]   Attr[0]: *tg.DocumentAttributeImageSize
+[2025-12-24 21:42:44]   Attr[1]: *tg.DocumentAttributeCustomEmoji
+[2025-12-24 21:42:44]     CustomEmoji.Alt: "👥" (len=4, bytes=[240 159 145 165])
+[2025-12-24 21:42:44]     CustomEmoji.Free: false
+[2025-12-24 21:42:44]     CustomEmoji.TextColor: true
+[2025-12-24 21:42:44]   Attr[2]: *tg.DocumentAttributeFilename
+[2025-12-24 21:42:44]   Extracted emoji: "👥" (len=4, bytes=[240 159 145 165])
+[2025-12-24 21:42:44] Final result: map[5258185631355378853:⭐️ 5258513401784573443:👥]
+[2025-12-24 21:42:44]   Replacement: offset 0-2 (runes 0-2) -> "⭐️"
+[2025-12-24 21:42:44]   Replacement: offset 2-4 (runes 2-3) -> "👥"
+[2025-12-24 21:42:44]   Original runes: [11088 65039 128101]
+[2025-12-24 21:42:44]   After replacements runes: [11088 65039 128101]
+[2025-12-24 21:42:44]   Final result: "⭐️👥" (bytes=[226 173 144 239 184 143 240 159 145 165])
+[2025-12-24 21:42:44] ExtractTextWithCustomEmojiResolved called
+[2025-12-24 21:42:44]   Input text: "👥" (len=4, bytes=[240 159 145 165])
+[2025-12-24 21:42:44]   Entities count: 1
+[2025-12-24 21:42:44]   Entity[0]: CustomEmoji offset=0 len=2 docID=5258513401784573443
+[2025-12-24 21:42:44] Resolving 1 document IDs: [5258513401784573443]
+[2025-12-24 21:42:44] Cache hit for ID 5258513401784573443: "👥"
+[2025-12-24 21:42:44] Final result: map[5258513401784573443:👥]
+[2025-12-24 21:42:44]   Replacement: offset 0-2 (runes 0-1) -> "👥"
+[2025-12-24 21:42:44]   Original runes: [128101]
+[2025-12-24 21:42:44]   After replacements runes: [128101]
+[2025-12-24 21:42:44]   Final result: "👥" (bytes=[240 159 145 165])
+[2025-12-24 21:42:44] ExtractTextWithCustomEmojiResolved called
+[2025-12-24 21:42:44]   Input text: "📝" (len=4, bytes=[240 159 147 157])
+[2025-12-24 21:42:44]   Entities count: 1
+[2025-12-24 21:42:44]   Entity[0]: CustomEmoji offset=0 len=2 docID=5257965174979042426
+[2025-12-24 21:42:44] Resolving 1 document IDs: [5257965174979042426]
+[2025-12-24 21:42:44] Fetching 1 emoji from API: [5257965174979042426]
+[2025-12-24 21:42:45] Got 1 documents from API
+[2025-12-24 21:42:45] Processing document ID 5257965174979042426
+[2025-12-24 21:42:45]   Attributes count: 3
+[2025-12-24 21:42:45]   Attr[0]: *tg.DocumentAttributeImageSize
+[2025-12-24 21:42:45]   Attr[1]: *tg.DocumentAttributeCustomEmoji
+[2025-12-24 21:42:45]     CustomEmoji.Alt: "📝" (len=4, bytes=[240 159 147 157])
+[2025-12-24 21:42:45]     CustomEmoji.Free: false
+[2025-12-24 21:42:45]     CustomEmoji.TextColor: true
+[2025-12-24 21:42:45]   Attr[2]: *tg.DocumentAttributeFilename
+[2025-12-24 21:42:45]   Extracted emoji: "📝" (len=4, bytes=[240 159 147 157])
+[2025-12-24 21:42:45] Final result: map[5257965174979042426:📝]
+[2025-12-24 21:42:45]   Replacement: offset 0-2 (runes 0-1) -> "📝"
+[2025-12-24 21:42:45]   Original runes: [128221]
+[2025-12-24 21:42:45]   After replacements runes: [128221]
+[2025-12-24 21:42:45]   Final result: "📝" (bytes=[240 159 147 157])
