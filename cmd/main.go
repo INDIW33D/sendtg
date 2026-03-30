@@ -98,9 +98,7 @@ func run() error {
 
 	// Start client in background
 	go func() {
-		if err := client.Start(); err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to start Telegram client: %v\n", err)
-		}
+		_ = client.Start()
 	}()
 
 	// Create and run TUI app

@@ -42,3 +42,8 @@ func (a *ManualAuthorizer) GetAuthState() (entity.AuthState, error) {
 func (a *ManualAuthorizer) AuthStateChan() <-chan entity.AuthState {
 	return a.client.AuthStateChan()
 }
+
+// EventChan returns auth state and error events for the UI.
+func (a *ManualAuthorizer) EventChan() <-chan AuthEvent {
+	return a.client.AuthEventChan()
+}

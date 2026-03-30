@@ -1,6 +1,7 @@
 package file
 
 import (
+	"context"
 	"fmt"
 	"os"
 
@@ -42,8 +43,8 @@ func (uc *UseCase) ValidateFile(filePath string) (*entity.FileInfo, error) {
 }
 
 // SendFile sends a file to a specific chat
-func (uc *UseCase) SendFile(chatID int64, filePath string) error {
-	return uc.fileRepo.SendFile(chatID, filePath)
+func (uc *UseCase) SendFile(ctx context.Context, chat entity.Chat, filePath string) error {
+	return uc.fileRepo.SendFile(ctx, chat, filePath)
 }
 
 // SetProgressChan sets the channel for progress updates

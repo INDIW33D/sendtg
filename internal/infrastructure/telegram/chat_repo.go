@@ -3,6 +3,8 @@ package telegram
 import (
 	"context"
 	"fmt"
+	"sync"
+	"time"
 
 	"github.com/gotd/td/tg"
 
@@ -12,15 +14,26 @@ import (
 
 // ChatRepository implements the ChatRepository interface
 type ChatRepository struct {
-	client *Client
-	cache  *cache.DialogCache
+	client         *Client
+	cache          *cache.DialogCache
+	blockedUsersMu sync.RWMutex
+	blockedUsers   map[int64]bool
+	blockedUsersAt time.Time
 }
+
+const blockedUsersCacheTTL = 5 * time.Minute
+
+const (
+	mainPeerFolderID    int32 = 0
+	archivePeerFolderID int32 = 1
+)
 
 // NewChatRepository creates a new chat repository
 func NewChatRepository(c *Client, dialogCache *cache.DialogCache) *ChatRepository {
 	return &ChatRepository{
-		client: c,
-		cache:  dialogCache,
+		client:       c,
+		cache:        dialogCache,
+		blockedUsers: make(map[int64]bool),
 	}
 }
 
@@ -32,32 +45,36 @@ func (r *ChatRepository) GetFolders() ([]entity.Folder, error) {
 	}
 
 	ctx := r.client.GetContext()
+	selfID, _ := r.currentAccountID()
 
-	// Get chat folders
-	result, err := api.MessagesGetDialogFilters(ctx)
+	foldersCtx, cancel := context.WithTimeout(ctx, dialogsRPCTimeout)
+	result, err := api.MessagesGetDialogFilters(foldersCtx)
+	cancel()
 	if err != nil {
-		// If error, just return "All Chats" folder
-		return []entity.Folder{
-			{ID: 0, Title: "All Chats"},
-		}, nil
+		return nil, fmt.Errorf("failed to get dialog filters: %w", err)
 	}
 
-	folders := make([]entity.Folder, 0, len(result.Filters)+1)
+	folders := make([]entity.Folder, 0, len(result.Filters)+2)
+	allChatsAdded := false
 
-	// Add "All Chats" as the first folder
-	folders = append(folders, entity.Folder{
-		ID:    0,
-		Title: "All Chats",
-	})
+	appendAllChats := func() {
+		if allChatsAdded {
+			return
+		}
+		folders = append(folders, entity.Folder{
+			Kind:  entity.FolderKindAll,
+			Title: "All Chats",
+		})
+		allChatsAdded = true
+	}
 
-	// Add user folders
 	for _, filter := range result.Filters {
 		switch f := filter.(type) {
 		case *tg.DialogFilterDefault:
-			// This is the default "All Chats" folder, skip it as we already added it
-			continue
+			appendAllChats()
 		case *tg.DialogFilter:
 			folder := entity.Folder{
+				Kind:               entity.FolderKindCustom,
 				ID:                 int32(f.ID),
 				Title:              ExtractTextWithCustomEmoji(f.Title),
 				IncludeContacts:    f.Contacts,
@@ -65,46 +82,36 @@ func (r *ChatRepository) GetFolders() ([]entity.Folder, error) {
 				IncludeGroups:      f.Groups,
 				IncludeBroadcasts:  f.Broadcasts,
 				IncludeBots:        f.Bots,
-				IncludedPeerIDs:    extractPeerIDs(f.IncludePeers),
-				ExcludedPeerIDs:    extractPeerIDs(f.ExcludePeers),
-				PinnedPeerIDs:      extractPeerIDs(f.PinnedPeers),
+				ExcludeMuted:       f.ExcludeMuted,
+				ExcludeRead:        f.ExcludeRead,
+				ExcludeArchived:    f.ExcludeArchived,
+				IncludedPeers:      extractPeers(f.IncludePeers, selfID),
+				ExcludedPeers:      extractPeers(f.ExcludePeers, selfID),
+				PinnedPeers:        extractPeers(f.PinnedPeers, selfID),
 			}
 			folders = append(folders, folder)
 		case *tg.DialogFilterChatlist:
 			folder := entity.Folder{
-				ID:              int32(f.ID),
-				Title:           ExtractTextWithCustomEmoji(f.Title),
-				IncludedPeerIDs: extractPeerIDs(f.IncludePeers),
-				PinnedPeerIDs:   extractPeerIDs(f.PinnedPeers),
+				Kind:          entity.FolderKindCustom,
+				ID:            int32(f.ID),
+				Title:         ExtractTextWithCustomEmoji(f.Title),
+				IncludedPeers: extractPeers(f.IncludePeers, selfID),
+				PinnedPeers:   extractPeers(f.PinnedPeers, selfID),
 			}
 			folders = append(folders, folder)
 		}
 	}
 
+	if !allChatsAdded {
+		folders = append([]entity.Folder{{Kind: entity.FolderKindAll, Title: "All Chats"}}, folders...)
+	}
+
+	folders = append(folders, entity.Folder{Kind: entity.FolderKindArchive, Title: "Archive"})
+
 	return folders, nil
 }
 
-// extractPeerIDs extracts peer IDs from InputPeer slice
-func extractPeerIDs(peers []tg.InputPeerClass) []int64 {
-	ids := make([]int64, 0, len(peers))
-	for _, peer := range peers {
-		switch p := peer.(type) {
-		case *tg.InputPeerUser:
-			ids = append(ids, p.UserID)
-		case *tg.InputPeerChat:
-			ids = append(ids, p.ChatID)
-		case *tg.InputPeerChannel:
-			ids = append(ids, p.ChannelID)
-		case *tg.InputPeerUserFromMessage:
-			ids = append(ids, p.UserID)
-		case *tg.InputPeerChannelFromMessage:
-			ids = append(ids, p.ChannelID)
-		}
-	}
-	return ids
-}
-
-// GetChatsByFolder returns chats in a specific folder
+// GetChatsByFolder returns chats from a peer folder (0 = main, 1 = archive).
 func (r *ChatRepository) GetChatsByFolder(folderID int32) ([]entity.Chat, error) {
 	api := r.client.GetAPI()
 	if api == nil {
@@ -112,9 +119,9 @@ func (r *ChatRepository) GetChatsByFolder(folderID int32) ([]entity.Chat, error)
 	}
 
 	ctx := r.client.GetContext()
+	blockedUsers := r.getBlockedUserIDs(ctx, api)
 
-	// Get dialogs (chats)
-	dialogs, err := r.getDialogs(ctx, api, folderID)
+	dialogs, err := r.getDialogsForPeerFolder(ctx, api, folderID, blockedUsers)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get dialogs: %w", err)
 	}
@@ -122,16 +129,32 @@ func (r *ChatRepository) GetChatsByFolder(folderID int32) ([]entity.Chat, error)
 	return dialogs, nil
 }
 
-// GetAllChats returns all chats (loads from server and updates cache)
+// GetAllChats returns the full dialog inventory from main dialogs and archive.
 func (r *ChatRepository) GetAllChats() ([]entity.Chat, error) {
-	chats, err := r.GetChatsByFolder(0)
+	api := r.client.GetAPI()
+	if api == nil {
+		return nil, fmt.Errorf("client not initialized")
+	}
+
+	ctx := r.client.GetContext()
+	blockedUsers := r.getBlockedUserIDs(ctx, api)
+
+	mainChats, err := r.getDialogsForPeerFolder(ctx, api, mainPeerFolderID, blockedUsers)
+	if err != nil {
+		return nil, err
+	}
+	archiveChats, err := r.getDialogsForPeerFolder(ctx, api, archivePeerFolderID, blockedUsers)
 	if err != nil {
 		return nil, err
 	}
 
+	chats := mergeChatInventories(mainChats, archiveChats)
+
 	// Update cache in background
 	if r.cache != nil {
-		go r.cache.SetChats(chats)
+		if accountID, err := r.currentAccountID(); err == nil {
+			go r.cache.SetChats(accountID, chats)
+		}
 	}
 
 	return chats, nil
@@ -142,12 +165,18 @@ func (r *ChatRepository) GetCachedChats() []entity.Chat {
 	if r.cache == nil {
 		return nil
 	}
+	if !r.canUseCache() {
+		return nil
+	}
 	return r.cache.GetChats()
 }
 
 // GetCachedFolders returns folders from cache (instant)
 func (r *ChatRepository) GetCachedFolders() []entity.Folder {
 	if r.cache == nil {
+		return nil
+	}
+	if !r.canUseCache() {
 		return nil
 	}
 	return r.cache.GetFolders()
@@ -158,7 +187,7 @@ func (r *ChatRepository) HasCachedData() bool {
 	if r.cache == nil {
 		return false
 	}
-	return r.cache.HasData()
+	return r.canUseCache() && r.cache.HasData()
 }
 
 // GetChatsFirstPage returns first page of chats quickly (for fast startup)
@@ -181,7 +210,9 @@ func (r *ChatRepository) GetChatsFirstPage(limit int) ([]entity.Chat, error) {
 		Hash:       0,
 	}
 
-	result, err := api.MessagesGetDialogs(ctx, req)
+	pageCtx, cancel := context.WithTimeout(ctx, dialogsRPCTimeout)
+	result, err := api.MessagesGetDialogs(pageCtx, req)
+	cancel()
 	if err != nil {
 		return nil, err
 	}
@@ -206,50 +237,123 @@ func (r *ChatRepository) GetChatsFirstPage(limit int) ([]entity.Chat, error) {
 		return nil, nil
 	}
 
-	return r.processDialogs(dialogs, messages, tgChats, users, blockedUsers)
+	return r.processDialogs(dialogs, messages, tgChats, users, blockedUsers, mainPeerFolderID)
 }
 
 // UpdateFoldersCache updates the folders cache
 func (r *ChatRepository) UpdateFoldersCache(folders []entity.Folder) {
 	if r.cache != nil {
-		go r.cache.SetFolders(folders)
+		if accountID, err := r.currentAccountID(); err == nil {
+			go r.cache.SetFolders(accountID, folders)
+		}
 	}
+}
+
+func (r *ChatRepository) currentAccountID() (int64, error) {
+	ctx, cancel := context.WithTimeout(r.client.GetContext(), profileRPCTimeout)
+	defer cancel()
+	return r.client.SelfID(ctx)
+}
+
+func (r *ChatRepository) canUseCache() bool {
+	if r.cache == nil || !r.cache.IsValid(cacheMaxAge) {
+		return false
+	}
+	accountID, err := r.currentAccountID()
+	if err != nil {
+		return false
+	}
+	return r.cache.GetAccountID() == accountID
 }
 
 // getBlockedUserIDs returns a set of blocked user IDs
 func (r *ChatRepository) getBlockedUserIDs(ctx context.Context, api *tg.Client) map[int64]bool {
-	blocked := make(map[int64]bool)
-
-	result, err := api.ContactsGetBlocked(ctx, &tg.ContactsGetBlockedRequest{
-		Limit: 1000, // Get up to 1000 blocked users
-	})
-	if err != nil {
+	if blocked, ok := r.getCachedBlockedUsers(true); ok {
 		return blocked
 	}
 
-	switch res := result.(type) {
-	case *tg.ContactsBlocked:
-		for _, peer := range res.Blocked {
-			if p, ok := peer.PeerID.(*tg.PeerUser); ok {
-				blocked[p.UserID] = true
+	blocked := make(map[int64]bool)
+	offset := 0
+	limit := 100
+
+	for {
+		blockedCtx, cancel := context.WithTimeout(ctx, blockedUsersRPCTimeout)
+		result, err := api.ContactsGetBlocked(blockedCtx, &tg.ContactsGetBlockedRequest{
+			Offset: offset,
+			Limit:  limit,
+		})
+		cancel()
+		if err != nil {
+			if cached, ok := r.getCachedBlockedUsers(false); ok {
+				return cached
 			}
+			return blocked
 		}
-	case *tg.ContactsBlockedSlice:
-		for _, peer := range res.Blocked {
-			if p, ok := peer.PeerID.(*tg.PeerUser); ok {
-				blocked[p.UserID] = true
+
+		pageCount := 0
+		switch res := result.(type) {
+		case *tg.ContactsBlocked:
+			pageCount = len(res.Blocked)
+			for _, peer := range res.Blocked {
+				if p, ok := peer.PeerID.(*tg.PeerUser); ok {
+					blocked[p.UserID] = true
+				}
 			}
+		case *tg.ContactsBlockedSlice:
+			pageCount = len(res.Blocked)
+			for _, peer := range res.Blocked {
+				if p, ok := peer.PeerID.(*tg.PeerUser); ok {
+					blocked[p.UserID] = true
+				}
+			}
+		default:
+			pageCount = 0
 		}
+
+		if pageCount < limit {
+			break
+		}
+		offset += pageCount
 	}
 
-	return blocked
+	r.storeBlockedUsers(blocked)
+	return cloneBlockedUsers(blocked)
 }
 
-// getDialogs fetches all dialogs from Telegram with pagination
-func (r *ChatRepository) getDialogs(ctx context.Context, api *tg.Client, folderID int32) ([]entity.Chat, error) {
-	// Get blocked users first
-	blockedUsers := r.getBlockedUserIDs(ctx, api)
+func (r *ChatRepository) getCachedBlockedUsers(requireFresh bool) (map[int64]bool, bool) {
+	r.blockedUsersMu.RLock()
+	defer r.blockedUsersMu.RUnlock()
 
+	if len(r.blockedUsers) == 0 {
+		return nil, false
+	}
+	if requireFresh && time.Since(r.blockedUsersAt) > blockedUsersCacheTTL {
+		return nil, false
+	}
+	return cloneBlockedUsers(r.blockedUsers), true
+}
+
+func (r *ChatRepository) storeBlockedUsers(blocked map[int64]bool) {
+	r.blockedUsersMu.Lock()
+	defer r.blockedUsersMu.Unlock()
+
+	r.blockedUsers = cloneBlockedUsers(blocked)
+	r.blockedUsersAt = time.Now()
+}
+
+func cloneBlockedUsers(src map[int64]bool) map[int64]bool {
+	if len(src) == 0 {
+		return make(map[int64]bool)
+	}
+	cloned := make(map[int64]bool, len(src))
+	for id, blocked := range src {
+		cloned[id] = blocked
+	}
+	return cloned
+}
+
+// getDialogsForPeerFolder fetches all dialogs from one peer folder with pagination.
+func (r *ChatRepository) getDialogsForPeerFolder(ctx context.Context, api *tg.Client, peerFolderID int32, blockedUsers map[int64]bool) ([]entity.Chat, error) {
 	var allDialogs []tg.DialogClass
 	var allMessages []tg.MessageClass
 	var allTgChats []tg.ChatClass
@@ -269,13 +373,17 @@ func (r *ChatRepository) getDialogs(ctx context.Context, api *tg.Client, folderI
 			Limit:      limit,
 			Hash:       0,
 		}
-
-		// FolderID in MessagesGetDialogs only works for archive (1)
-		if folderID == 1 {
-			req.FolderID = 1
+		if offsetDate != 0 || offsetID != 0 || inputPeerKey(offsetPeer) != "" {
+			req.ExcludePinned = true
 		}
 
-		result, err := api.MessagesGetDialogs(ctx, req)
+		if peerFolderID == archivePeerFolderID {
+			req.FolderID = int(archivePeerFolderID)
+		}
+
+		dialogsCtx, cancel := context.WithTimeout(ctx, dialogsRPCTimeout)
+		result, err := api.MessagesGetDialogs(dialogsCtx, req)
+		cancel()
 		if err != nil {
 			return nil, err
 		}
@@ -285,10 +393,10 @@ func (r *ChatRepository) getDialogs(ctx context.Context, api *tg.Client, folderI
 		var tgChats []tg.ChatClass
 		var users []tg.UserClass
 		var totalCount int
+		noChanges := false
 
 		switch res := result.(type) {
 		case *tg.MessagesDialogs:
-			// All dialogs returned at once
 			dialogs = res.Dialogs
 			messages = res.Messages
 			tgChats = res.Chats
@@ -301,7 +409,10 @@ func (r *ChatRepository) getDialogs(ctx context.Context, api *tg.Client, folderI
 			users = res.Users
 			totalCount = res.Count
 		case *tg.MessagesDialogsNotModified:
-			// No changes
+			noChanges = true
+		}
+
+		if noChanges {
 			break
 		}
 
@@ -317,89 +428,42 @@ func (r *ChatRepository) getDialogs(ctx context.Context, api *tg.Client, folderI
 		}
 
 		// Update offset for next page
-		if len(dialogs) > 0 {
-			lastDialog := dialogs[len(dialogs)-1]
-			if d, ok := lastDialog.(*tg.Dialog); ok {
-				// Find the last message date for offset
-				for _, m := range messages {
-					if msg, ok := m.(*tg.Message); ok {
-						if getPeerID(msg.PeerID) == getPeerID(d.Peer) {
-							offsetDate = msg.Date
-							offsetID = msg.ID
-							break
-						}
-					}
-				}
-				// Create offset peer
-				offsetPeer = peerToInputPeer(d.Peer, allUsers, allTgChats)
-			}
+		pageUserMap := buildUserMap(users)
+		pageChannelMap := buildChannelMap(tgChats)
+		nextOffsetDate, nextOffsetID, nextOffsetPeer, ok := nextDialogsPageOffset(dialogs, messages, pageUserMap, pageChannelMap)
+		if !ok {
+			break
 		}
+
+		if nextOffsetDate == offsetDate && nextOffsetID == offsetID && inputPeerKey(nextOffsetPeer) == inputPeerKey(offsetPeer) {
+			break
+		}
+
+		offsetDate = nextOffsetDate
+		offsetID = nextOffsetID
+		offsetPeer = nextOffsetPeer
 	}
 
 	// Process accumulated results
-	return r.processDialogs(allDialogs, allMessages, allTgChats, allUsers, blockedUsers)
-}
-
-// peerToInputPeer converts PeerClass to InputPeerClass
-func peerToInputPeer(peer tg.PeerClass, users []tg.UserClass, chats []tg.ChatClass) tg.InputPeerClass {
-	switch p := peer.(type) {
-	case *tg.PeerUser:
-		for _, u := range users {
-			if user, ok := u.(*tg.User); ok && user.ID == p.UserID {
-				return &tg.InputPeerUser{
-					UserID:     user.ID,
-					AccessHash: user.AccessHash,
-				}
-			}
-		}
-	case *tg.PeerChat:
-		return &tg.InputPeerChat{ChatID: p.ChatID}
-	case *tg.PeerChannel:
-		for _, c := range chats {
-			if channel, ok := c.(*tg.Channel); ok && channel.ID == p.ChannelID {
-				return &tg.InputPeerChannel{
-					ChannelID:  channel.ID,
-					AccessHash: channel.AccessHash,
-				}
-			}
-		}
-	}
-	return &tg.InputPeerEmpty{}
+	return r.processDialogs(allDialogs, allMessages, allTgChats, allUsers, blockedUsers, peerFolderID)
 }
 
 // processDialogs processes dialogs and extracts chat entities
-func (r *ChatRepository) processDialogs(dialogs []tg.DialogClass, messages []tg.MessageClass, tgChats []tg.ChatClass, users []tg.UserClass, blockedUsers map[int64]bool) ([]entity.Chat, error) {
-	// Build message date map (peer -> last message date)
-	msgDateMap := make(map[int64]int)
+func (r *ChatRepository) processDialogs(dialogs []tg.DialogClass, messages []tg.MessageClass, tgChats []tg.ChatClass, users []tg.UserClass, blockedUsers map[int64]bool, sourceFolderID int32) ([]entity.Chat, error) {
+	// Build message date map (typed peer -> last message date)
+	msgDateMap := make(map[string]int)
 	for _, m := range messages {
-		if msg, ok := m.(*tg.Message); ok {
-			peerID := getPeerID(msg.PeerID)
-			if peerID != 0 {
-				if existing, ok := msgDateMap[peerID]; !ok || msg.Date > existing {
-					msgDateMap[peerID] = msg.Date
-				}
+		if peerKey, msgDate, _, ok := messagePeerAndMeta(m); ok {
+			if existing, ok := msgDateMap[peerKey]; !ok || msgDate > existing {
+				msgDateMap[peerKey] = msgDate
 			}
 		}
 	}
 
-	// Build user map
-	userMap := make(map[int64]*tg.User)
-	for _, u := range users {
-		if user, ok := u.(*tg.User); ok {
-			userMap[user.ID] = user
-		}
-	}
-
-	// Build chat map
-	chatMap := make(map[int64]tg.ChatClass)
-	for _, c := range tgChats {
-		switch chat := c.(type) {
-		case *tg.Chat:
-			chatMap[chat.ID] = c
-		case *tg.Channel:
-			chatMap[chat.ID] = c
-		}
-	}
+	userMap := buildUserMap(users)
+	basicChatMap := buildBasicChatMap(tgChats)
+	channelMap := buildChannelMap(tgChats)
+	nowUnix := int(time.Now().Unix())
 
 	// Extract chats from dialogs in order (with deduplication)
 	chats := make([]entity.Chat, 0, len(dialogs))
@@ -411,8 +475,12 @@ func (r *ChatRepository) processDialogs(dialogs []tg.DialogClass, messages []tg.
 			continue
 		}
 
-		// Create unique key based on peer type and ID
-		peerKey := getPeerKey(dialog.Peer)
+		peerRef, ok := peerRefFromPeer(dialog.Peer, userMap, channelMap)
+		if !ok {
+			continue
+		}
+
+		peerKey := peerRef.Key()
 
 		// Skip duplicates
 		if seenKeys[peerKey] {
@@ -420,9 +488,16 @@ func (r *ChatRepository) processDialogs(dialogs []tg.DialogClass, messages []tg.
 		}
 		seenKeys[peerKey] = true
 
-		peerID := getPeerID(dialog.Peer)
-		lastMsgDate := msgDateMap[peerID]
+		lastMsgDate := msgDateMap[peerKey]
 		isPinned := dialog.Pinned
+		isArchived := sourceFolderID == archivePeerFolderID
+		if folderID, ok := dialog.GetFolderID(); ok {
+			isArchived = folderID == int(archivePeerFolderID)
+		}
+		muteUntil, hasMuteUntil := dialog.NotifySettings.GetMuteUntil()
+		isMuted := hasMuteUntil && muteUntil > nowUnix
+		unreadCount := dialog.UnreadCount
+		unreadMarked := dialog.UnreadMark
 
 		// Track pin order for pinned chats
 		currentPinOrder := -1
@@ -449,13 +524,17 @@ func (r *ChatRepository) processDialogs(dialogs []tg.DialogClass, messages []tg.
 				name += " " + user.LastName
 			}
 			chats = append(chats, entity.Chat{
-				ID:              user.ID,
+				Peer:            peerRef,
 				Title:           name,
 				Type:            entity.ChatTypePrivate,
 				Username:        user.Username,
 				LastMessageDate: lastMsgDate,
 				IsContact:       user.Contact,
 				IsBot:           user.Bot,
+				IsArchived:      isArchived,
+				IsMuted:         isMuted,
+				UnreadCount:     unreadCount,
+				UnreadMarked:    unreadMarked,
 				IsPinned:        isPinned,
 				PinOrder:        currentPinOrder,
 				Order:           currentOrder,
@@ -463,106 +542,194 @@ func (r *ChatRepository) processDialogs(dialogs []tg.DialogClass, messages []tg.
 			})
 
 		case *tg.PeerChat:
-			c, ok := chatMap[peer.ChatID]
+			chat, ok := basicChatMap[peer.ChatID]
 			if !ok {
 				continue
 			}
-			if chat, ok := c.(*tg.Chat); ok {
-				// Skip migrated groups - their supergroups are already in the list
-				// at the correct position based on last message date
-				if chat.MigratedTo != nil {
-					continue
-				}
 
-				// Check if user can write to this group
-				canWrite := !chat.Left && !chat.Deactivated
-				if canWrite && chat.DefaultBannedRights.SendMessages {
-					canWrite = false
-				}
-
-				chats = append(chats, entity.Chat{
-					ID:              chat.ID,
-					Title:           chat.Title,
-					Type:            entity.ChatTypeGroup,
-					LastMessageDate: lastMsgDate,
-					IsPinned:        isPinned,
-					PinOrder:        currentPinOrder,
-					Order:           currentOrder,
-					CanWrite:        canWrite,
-				})
+			// Skip migrated groups - their supergroups are already in the list
+			// at the correct position based on last message date
+			if chat.MigratedTo != nil {
+				continue
 			}
+
+			// Check if user can write to this group
+			canWrite := !chat.Left && !chat.Deactivated
+			if canWrite && chat.DefaultBannedRights.SendMessages {
+				canWrite = false
+			}
+
+			chats = append(chats, entity.Chat{
+				Peer:            peerRef,
+				Title:           chat.Title,
+				Type:            entity.ChatTypeGroup,
+				LastMessageDate: lastMsgDate,
+				IsArchived:      isArchived,
+				IsMuted:         isMuted,
+				UnreadCount:     unreadCount,
+				UnreadMarked:    unreadMarked,
+				IsPinned:        isPinned,
+				PinOrder:        currentPinOrder,
+				Order:           currentOrder,
+				CanWrite:        canWrite,
+			})
 
 		case *tg.PeerChannel:
-			c, ok := chatMap[peer.ChannelID]
+			channel, ok := channelMap[peer.ChannelID]
 			if !ok {
 				continue
 			}
-			if channel, ok := c.(*tg.Channel); ok {
-				chatType := entity.ChatTypeSupergroup
-				if channel.Broadcast {
-					chatType = entity.ChatTypeChannel
-				}
 
-				// Check if user can write to this channel/supergroup
-				canWrite := !channel.Left
-
-				if channel.Broadcast {
-					// For broadcast channels: can write only if creator or has PostMessages admin right
-					canWrite = false
-					if channel.Creator {
-						canWrite = true
-					} else if adminRights, ok := channel.GetAdminRights(); ok {
-						canWrite = adminRights.PostMessages
-					}
-				} else {
-					// For supergroups: check DefaultBannedRights
-					if canWrite {
-						if rights, ok := channel.GetDefaultBannedRights(); ok && rights.SendMessages {
-							canWrite = false
-						}
-					}
-				}
-
-				chats = append(chats, entity.Chat{
-					ID:              channel.ID,
-					Title:           channel.Title,
-					Type:            chatType,
-					Username:        channel.Username,
-					LastMessageDate: lastMsgDate,
-					IsPinned:        isPinned,
-					PinOrder:        currentPinOrder,
-					Order:           currentOrder,
-					CanWrite:        canWrite,
-				})
+			chatType := entity.ChatTypeSupergroup
+			if channel.Broadcast {
+				chatType = entity.ChatTypeChannel
 			}
+
+			// Check if user can write to this channel/supergroup
+			canWrite := !channel.Left
+
+			if channel.Broadcast {
+				// For broadcast channels: can write only if creator or has PostMessages admin right
+				canWrite = false
+				if channel.Creator {
+					canWrite = true
+				} else if adminRights, ok := channel.GetAdminRights(); ok {
+					canWrite = adminRights.PostMessages
+				}
+			} else {
+				// For supergroups: check DefaultBannedRights
+				if canWrite {
+					if rights, ok := channel.GetDefaultBannedRights(); ok && rights.SendMessages {
+						canWrite = false
+					}
+				}
+			}
+
+			chats = append(chats, entity.Chat{
+				Peer:            peerRef,
+				Title:           channel.Title,
+				Type:            chatType,
+				Username:        channel.Username,
+				LastMessageDate: lastMsgDate,
+				IsArchived:      isArchived,
+				IsMuted:         isMuted,
+				UnreadCount:     unreadCount,
+				UnreadMarked:    unreadMarked,
+				IsPinned:        isPinned,
+				PinOrder:        currentPinOrder,
+				Order:           currentOrder,
+				CanWrite:        canWrite,
+			})
 		}
 	}
 
 	return chats, nil
 }
 
-// getPeerKey returns a unique string key for a peer (type:id)
-func getPeerKey(peer tg.PeerClass) string {
-	switch p := peer.(type) {
-	case *tg.PeerUser:
-		return fmt.Sprintf("user:%d", p.UserID)
-	case *tg.PeerChat:
-		return fmt.Sprintf("chat:%d", p.ChatID)
-	case *tg.PeerChannel:
-		return fmt.Sprintf("channel:%d", p.ChannelID)
+func mergeChatInventories(mainChats []entity.Chat, archiveChats []entity.Chat) []entity.Chat {
+	merged := make([]entity.Chat, 0, len(mainChats)+len(archiveChats))
+	seen := make(map[string]bool, len(mainChats)+len(archiveChats))
+	nextOrder := 0
+
+	appendChats := func(chats []entity.Chat) {
+		for _, chat := range chats {
+			key := chat.UniqueKey()
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			chat.Order = nextOrder
+			nextOrder++
+			merged = append(merged, chat)
+		}
 	}
-	return ""
+
+	appendChats(mainChats)
+	appendChats(archiveChats)
+	return merged
 }
 
-// getPeerID extracts peer ID from PeerClass
-func getPeerID(peer tg.PeerClass) int64 {
-	switch p := peer.(type) {
-	case *tg.PeerUser:
-		return p.UserID
-	case *tg.PeerChat:
-		return p.ChatID
-	case *tg.PeerChannel:
-		return p.ChannelID
+func buildUserMap(users []tg.UserClass) map[int64]*tg.User {
+	userMap := make(map[int64]*tg.User, len(users))
+	for _, u := range users {
+		if user, ok := u.(*tg.User); ok {
+			userMap[user.ID] = user
+		}
 	}
-	return 0
+	return userMap
+}
+
+func buildBasicChatMap(chats []tg.ChatClass) map[int64]*tg.Chat {
+	chatMap := make(map[int64]*tg.Chat)
+	for _, c := range chats {
+		if chat, ok := c.(*tg.Chat); ok {
+			chatMap[chat.ID] = chat
+		}
+	}
+	return chatMap
+}
+
+func buildChannelMap(chats []tg.ChatClass) map[int64]*tg.Channel {
+	channelMap := make(map[int64]*tg.Channel)
+	for _, c := range chats {
+		if channel, ok := c.(*tg.Channel); ok {
+			channelMap[channel.ID] = channel
+		}
+	}
+	return channelMap
+}
+
+func nextDialogsPageOffset(dialogs []tg.DialogClass, messages []tg.MessageClass, userMap map[int64]*tg.User, channelMap map[int64]*tg.Channel) (int, int, tg.InputPeerClass, bool) {
+	for i := len(dialogs) - 1; i >= 0; i-- {
+		dialog, ok := dialogs[i].(*tg.Dialog)
+		if !ok || dialog.TopMessage == 0 {
+			continue
+		}
+
+		nextOffsetPeer := inputPeerFromDialogPeer(dialog.Peer, userMap, channelMap)
+		if inputPeerKey(nextOffsetPeer) == "" {
+			continue
+		}
+
+		nextOffsetDate, _ := dialogTopMessageDate(dialog.Peer, dialog.TopMessage, messages)
+		return nextOffsetDate, dialog.TopMessage, nextOffsetPeer, true
+	}
+
+	return 0, 0, &tg.InputPeerEmpty{}, false
+}
+
+func dialogTopMessageDate(peer tg.PeerClass, topMessageID int, messages []tg.MessageClass) (int, bool) {
+	targetPeerKey := peerKey(peer)
+	if targetPeerKey == "" || topMessageID == 0 {
+		return 0, false
+	}
+
+	fallbackDate := 0
+	fallbackFound := false
+	for _, message := range messages {
+		msgPeerKey, msgDate, msgID, ok := messagePeerAndMeta(message)
+		if !ok || msgPeerKey != targetPeerKey {
+			continue
+		}
+		if msgID == topMessageID {
+			return msgDate, true
+		}
+		if !fallbackFound || msgDate > fallbackDate {
+			fallbackDate = msgDate
+			fallbackFound = true
+		}
+	}
+
+	return fallbackDate, fallbackFound
+}
+
+func messagePeerAndMeta(message tg.MessageClass) (string, int, int, bool) {
+	switch msg := message.(type) {
+	case *tg.Message:
+		return peerKey(msg.PeerID), msg.Date, msg.ID, true
+	case *tg.MessageService:
+		return peerKey(msg.PeerID), msg.Date, msg.ID, true
+	default:
+		return "", 0, 0, false
+	}
 }

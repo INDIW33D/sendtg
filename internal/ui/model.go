@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -22,6 +24,13 @@ type (
 
 	// FoldersLoadedMsg is sent when folders are loaded
 	FoldersLoadedMsg struct {
+		Folders   []entity.Folder
+		Err       error
+		FromCache bool
+	}
+
+	// FoldersRefreshedMsg is sent when folders are refreshed from server.
+	FoldersRefreshedMsg struct {
 		Folders []entity.Folder
 		Err     error
 	}
@@ -49,6 +58,12 @@ type (
 		Err error
 	}
 
+	// AuthErrorMsg is sent when the auth flow fails.
+	AuthErrorMsg struct {
+		Err         error
+		Recoverable bool
+	}
+
 	// InitCompleteMsg is sent when initialization is complete
 	InitCompleteMsg struct {
 		AuthState entity.AuthState
@@ -58,6 +73,8 @@ type (
 	// UploadProgressMsg is sent when upload progress updates
 	UploadProgressMsg entity.UploadProgress
 )
+
+const initialAuthEventTimeout = 45 * time.Second
 
 // Model is the main application model
 type Model struct {
@@ -84,8 +101,8 @@ type Model struct {
 	progressChan chan entity.UploadProgress
 
 	// File sending
-	cancelUpload   chan struct{}
 	fileSendResult chan error
+	sendCancel     context.CancelFunc
 }
 
 // NewModel creates a new model
@@ -138,7 +155,6 @@ func NewModel(useCases *UseCases, client *telegram.Client, authorizer *telegram.
 		spinner:        s,
 		progressBar:    p,
 		progressChan:   progressChan,
-		cancelUpload:   make(chan struct{}),
 		fileSendResult: make(chan error, 1),
 	}
 }
@@ -160,16 +176,33 @@ func (m *Model) checkAuthState() tea.Msg {
 
 	// If state is Unknown, wait for the first real state from channel
 	if state == entity.AuthStateUnknown {
-		state = <-m.authorizer.AuthStateChan()
+		select {
+		case event := <-m.authorizer.EventChan():
+			if event.Err != nil {
+				return InitCompleteMsg{Err: event.Err}
+			}
+			state = event.State
+		case <-time.After(initialAuthEventTimeout):
+			return InitCompleteMsg{Err: fmt.Errorf("timed out waiting for Telegram auth state")}
+		case <-m.client.GetContext().Done():
+			return InitCompleteMsg{Err: m.client.GetContext().Err()}
+		}
 	}
 
 	return InitCompleteMsg{AuthState: state}
 }
 
-// listenAuthState listens for auth state changes
-func (m *Model) listenAuthState() tea.Msg {
-	state := <-m.authorizer.AuthStateChan()
-	return AuthStateMsg(state)
+// listenAuthEvent listens for auth state and error changes.
+func (m *Model) listenAuthEvent() tea.Msg {
+	select {
+	case event := <-m.authorizer.EventChan():
+		if event.Err != nil {
+			return AuthErrorMsg{Err: event.Err, Recoverable: event.Recoverable}
+		}
+		return AuthStateMsg(event.State)
+	case <-m.client.GetContext().Done():
+		return AuthErrorMsg{Err: m.client.GetContext().Err()}
+	}
 }
 
 // loadFolders loads the folders (tries cache first)
@@ -177,12 +210,18 @@ func (m *Model) loadFolders() tea.Msg {
 	// Try to load from cache first for instant display
 	cachedFolders := m.useCases.Chat.GetCachedFolders()
 	if len(cachedFolders) > 0 {
-		return FoldersLoadedMsg{Folders: cachedFolders, Err: nil}
+		return FoldersLoadedMsg{Folders: cachedFolders, Err: nil, FromCache: true}
 	}
 
 	// Load from server
 	folders, err := m.useCases.Chat.GetFolders()
-	return FoldersLoadedMsg{Folders: folders, Err: err}
+	return FoldersLoadedMsg{Folders: folders, Err: err, FromCache: false}
+}
+
+// refreshFoldersFromServer loads fresh folders from server.
+func (m *Model) refreshFoldersFromServer() tea.Msg {
+	folders, err := m.useCases.Chat.GetFolders()
+	return FoldersRefreshedMsg{Folders: folders, Err: err}
 }
 
 // loadAllChats loads all chats (tries cache first, then loads from server)
@@ -213,9 +252,21 @@ func (m *Model) filterChatsForFolder() {
 	} else {
 		folder := m.state.Folders[m.state.SelectedFolder]
 
-		// "All Chats" folder shows everything with global pinned status
-		if folder.IsAllChats() {
-			baseChats = deduplicateChats(m.state.AllChats)
+		// Built-in folders use the server-backed chat inventory directly.
+		if folder.IsAllChats() || folder.IsArchive() {
+			filtered := make([]entity.Chat, 0, len(m.state.AllChats))
+			seenKeys := make(map[string]bool)
+			for _, chat := range m.state.AllChats {
+				key := chat.UniqueKey()
+				if seenKeys[key] {
+					continue
+				}
+				if folder.ContainsChat(chat) {
+					filtered = append(filtered, chat)
+					seenKeys[key] = true
+				}
+			}
+			baseChats = filtered
 		} else {
 			// Filter chats based on folder settings
 			filtered := make([]entity.Chat, 0)
@@ -225,7 +276,7 @@ func (m *Model) filterChatsForFolder() {
 				if seenKeys[key] {
 					continue
 				}
-				if folder.ContainsChat(chat, chat.IsContact) {
+				if folder.ContainsChat(chat) {
 					filtered = append(filtered, chat)
 					seenKeys[key] = true
 				}
@@ -249,6 +300,22 @@ func (m *Model) filterChatsForFolder() {
 
 	m.state.Chats = sortChatsForFolder(baseChats, folder)
 	m.state.SelectedChat = 0
+}
+
+func (m *Model) applyFolders(folders []entity.Folder) {
+	selectedFolderKey := string(entity.FolderKindAll)
+	if m.state.SelectedFolder >= 0 && m.state.SelectedFolder < len(m.state.Folders) {
+		selectedFolderKey = m.state.Folders[m.state.SelectedFolder].Key()
+	}
+
+	m.state.Folders = folders
+	m.state.SelectedFolder = 0
+	for i, folder := range folders {
+		if folder.Key() == selectedFolderKey {
+			m.state.SelectedFolder = i
+			break
+		}
+	}
 }
 
 // filterWritableChats filters to only include chats where user can send messages
@@ -297,16 +364,16 @@ func sortChatsForFolder(chats []entity.Chat, folder entity.Folder) []entity.Chat
 		var iPinned, jPinned bool
 		var iPinOrder, jPinOrder int
 
-		// For "All Chats" folder, use global pinned status
-		if folder.IsAllChats() {
+		// Built-in folders use the pinned order returned by Telegram for that peer folder.
+		if folder.IsAllChats() || folder.IsArchive() {
 			iPinned = sorted[i].IsPinned
 			jPinned = sorted[j].IsPinned
 			iPinOrder = sorted[i].PinOrder
 			jPinOrder = sorted[j].PinOrder
 		} else {
 			// For other folders, use folder-specific pinned peers
-			iPinned, iPinOrder = folder.IsPinnedInFolder(sorted[i].ID)
-			jPinned, jPinOrder = folder.IsPinnedInFolder(sorted[j].ID)
+			iPinned, iPinOrder = folder.IsPinnedInFolder(sorted[i].Peer)
+			jPinned, jPinOrder = folder.IsPinnedInFolder(sorted[j].Peer)
 		}
 
 		// Pinned chats come first
@@ -320,7 +387,10 @@ func sortChatsForFolder(chats []entity.Chat, folder entity.Folder) []entity.Chat
 		if iPinned && jPinned {
 			return iPinOrder < jPinOrder
 		}
-		// Both not pinned - sort by original Telegram API order (lower = earlier in list)
+		// Both not pinned - prefer newer chats, then stable Telegram order.
+		if sorted[i].LastMessageDate != sorted[j].LastMessageDate {
+			return sorted[i].LastMessageDate > sorted[j].LastMessageDate
+		}
 		return sorted[i].Order < sorted[j].Order
 	})
 
@@ -334,13 +404,16 @@ func (m *Model) startFileSend() tea.Cmd {
 			return FileSentMsg{Err: fmt.Errorf("invalid chat selection")}
 		}
 		chat := m.state.Chats[m.state.SelectedChat]
+		sendCtx, cancel := context.WithCancel(m.client.GetContext())
+		m.sendCancel = cancel
 
 		// Set progress channel before sending
 		m.useCases.File.SetProgressChan(m.progressChan)
 
 		// Run upload in goroutine
 		go func() {
-			err := m.useCases.File.SendFile(chat.ID, m.state.FilePath)
+			defer cancel()
+			err := m.useCases.File.SendFile(sendCtx, chat, m.state.FilePath)
 			m.fileSendResult <- err
 		}()
 
@@ -353,8 +426,6 @@ func (m *Model) waitForFileSent() tea.Msg {
 	select {
 	case err := <-m.fileSendResult:
 		return FileSentMsg{Err: err}
-	case <-m.cancelUpload:
-		return FileSentMsg{Err: fmt.Errorf("upload cancelled")}
 	case <-time.After(100 * time.Millisecond):
 		return nil // Continue waiting
 	}
@@ -426,22 +497,35 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.state.AuthState = msg.AuthState
 		model, cmd := m.handleAuthState(msg.AuthState)
-		// Start listening for auth state changes after initial check
-		return model, tea.Batch(cmd, m.listenAuthState)
+		// Start listening for auth state changes after initial check.
+		return model, tea.Batch(cmd, m.listenAuthEvent)
 
 	case AuthStateMsg:
 		newState := entity.AuthState(msg)
 		// If we're already authorized and loading/showing main screen, ignore intermediate auth states
 		if newState == entity.AuthStateReady && (m.state.Screen == ScreenLoading || m.state.Screen == ScreenMain) {
-			return m, m.listenAuthState
+			return m, m.listenAuthEvent
 		}
 		// If we're in sending/result screen, don't interrupt
 		if m.state.Screen == ScreenSending || m.state.Screen == ScreenResult {
-			return m, m.listenAuthState
+			return m, m.listenAuthEvent
 		}
 		m.state.AuthState = newState
 		model, cmd := m.handleAuthState(newState)
-		return model, tea.Batch(cmd, m.listenAuthState)
+		return model, tea.Batch(cmd, m.listenAuthEvent)
+
+	case AuthErrorMsg:
+		m.state.Loading = false
+		m.state.ErrorMsg = msg.Err.Error()
+		if msg.Recoverable {
+			if m.state.Screen != ScreenAuth {
+				m.state.Screen = ScreenAuth
+			}
+			return m, m.listenAuthEvent
+		}
+		m.state.Success = false
+		m.state.Screen = ScreenResult
+		return m, nil
 
 	case FoldersLoadedMsg:
 		if msg.Err != nil {
@@ -451,10 +535,21 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.state.ErrorMsg = fmt.Sprintf("Failed to load folders: %v", msg.Err)
 			return m, nil
 		}
-		m.state.Folders = msg.Folders
-		m.state.SelectedFolder = 0
+		m.applyFolders(msg.Folders)
 		// Load all chats once
+		if msg.FromCache {
+			return m, tea.Batch(m.loadAllChats, m.refreshFoldersFromServer)
+		}
 		return m, m.loadAllChats
+
+	case FoldersRefreshedMsg:
+		if msg.Err == nil {
+			m.applyFolders(msg.Folders)
+			if len(m.state.AllChats) > 0 {
+				m.filterChatsForFolder()
+			}
+		}
+		return m, nil
 
 	case ChatsLoadedMsg:
 		m.state.Loading = false
@@ -478,20 +573,29 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case ChatsRefreshedMsg:
 		// Update chats with fresh data from server (silently, no UI change)
-		if msg.Err == nil && len(msg.Chats) > 0 {
+		if msg.Err == nil {
 			m.state.AllChats = msg.Chats
 			m.filterChatsForFolder()
 		}
 		return m, nil
 
 	case FileSentMsg:
+		if m.sendCancel != nil {
+			m.sendCancel()
+			m.sendCancel = nil
+		}
 		m.state.Loading = false
 		m.state.Screen = ScreenResult
 		if msg.Err != nil {
 			m.state.Success = false
-			m.state.ErrorMsg = fmt.Sprintf("Failed to send file: %v", msg.Err)
+			if errors.Is(msg.Err, context.Canceled) {
+				m.state.ErrorMsg = "Upload cancelled by user"
+			} else {
+				m.state.ErrorMsg = fmt.Sprintf("Failed to send file: %v", msg.Err)
+			}
 		} else {
 			m.state.Success = true
+			m.state.ErrorMsg = ""
 			m.state.ResultMsg = fmt.Sprintf("File '%s' successfully sent to %s", m.state.FileInfo.Name, m.state.SelectedName)
 		}
 		return m, nil
@@ -527,6 +631,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // handleAuthState handles auth state changes
 func (m *Model) handleAuthState(state entity.AuthState) (*Model, tea.Cmd) {
+	m.state.ErrorMsg = ""
+	m.state.Loading = false
+
 	switch state {
 	case entity.AuthStateReady:
 		m.state.Screen = ScreenLoading
@@ -563,6 +670,7 @@ func (m *Model) updateAuth(msg tea.Msg) (*Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "enter":
+			m.state.ErrorMsg = ""
 			switch m.state.AuthStep {
 			case AuthStepPhone:
 				phone := m.phoneInput.Value()
@@ -570,9 +678,7 @@ func (m *Model) updateAuth(msg tea.Msg) (*Model, tea.Cmd) {
 					return m, nil
 				}
 				m.state.Loading = true
-				go func() {
-					m.authorizer.SendPhoneNumber(phone)
-				}()
+				m.authorizer.SendPhoneNumber(phone)
 				return m, m.spinner.Tick
 			case AuthStepCode:
 				code := m.codeInput.Value()
@@ -580,9 +686,7 @@ func (m *Model) updateAuth(msg tea.Msg) (*Model, tea.Cmd) {
 					return m, nil
 				}
 				m.state.Loading = true
-				go func() {
-					m.authorizer.SendCode(code)
-				}()
+				m.authorizer.SendCode(code)
 				return m, m.spinner.Tick
 			case AuthStepPassword:
 				password := m.passwordInput.Value()
@@ -590,9 +694,7 @@ func (m *Model) updateAuth(msg tea.Msg) (*Model, tea.Cmd) {
 					return m, nil
 				}
 				m.state.Loading = true
-				go func() {
-					m.authorizer.SendPassword(password)
-				}()
+				m.authorizer.SendPassword(password)
 				return m, m.spinner.Tick
 			}
 		}
@@ -667,9 +769,9 @@ func (m *Model) updateMain(msg tea.Msg) (*Model, tea.Cmd) {
 			}
 			m.state.SelectedName = m.state.Chats[m.state.SelectedChat].DisplayName()
 			m.state.Loading = true
+			m.state.ErrorMsg = ""
 			m.state.Screen = ScreenSending
-			m.state.UploadProgress = entity.UploadProgress{Total: m.state.FileInfo.Size}
-			m.cancelUpload = make(chan struct{})
+			m.state.UploadProgress = entity.UploadProgress{Total: m.state.FileInfo.Size, Percent: initialUploadPercent(m.state.FileInfo.Size)}
 			return m, tea.Batch(m.startFileSend(), m.tickProgress(), m.waitForFileSent)
 		default:
 			// Handle regular character input for search
@@ -718,7 +820,7 @@ func (m *Model) View() string {
 	var s strings.Builder
 
 	// Header
-	s.WriteString(TitleStyle.Render("📤 SendTG - Send File to Telegram"))
+	s.WriteString(TitleStyle.Render(titleText()))
 	s.WriteString("\n")
 
 	// File info
@@ -780,6 +882,11 @@ func (m *Model) viewAuth() string {
 		s.WriteString(" Authenticating...")
 	}
 
+	if m.state.ErrorMsg != "" {
+		s.WriteString("\n\n")
+		s.WriteString(ErrorStyle.Render(m.state.ErrorMsg))
+	}
+
 	s.WriteString("\n\n")
 	s.WriteString(HelpStyle.Render("Press Enter to submit"))
 
@@ -796,7 +903,7 @@ func (m *Model) viewMain() string {
 
 	// Show search query if active
 	if m.state.SearchQuery != "" {
-		s.WriteString(SearchStyle.Render(fmt.Sprintf("🔍 Search: %s", m.state.SearchQuery)))
+		s.WriteString(SearchStyle.Render(searchText(m.state.SearchQuery)))
 		s.WriteString("\n\n")
 	}
 
@@ -845,26 +952,17 @@ func (m *Model) viewMain() string {
 				style = SelectedStyle
 			}
 
-			// Add icon based on chat type
-			icon := "👤"
-			switch chat.Type {
-			case entity.ChatTypeGroup:
-				icon = "👥"
-			case entity.ChatTypeSupergroup:
-				icon = "👥"
-			case entity.ChatTypeChannel:
-				icon = "📢"
-			}
+			icon := chatTypeIcon(chat.Type)
 
 			// Add pin indicator (check folder-specific pins or global for "All Chats")
 			pinIndicator := ""
-			if currentFolder.IsAllChats() {
+			if currentFolder.IsAllChats() || currentFolder.IsArchive() {
 				if chat.IsPinned {
-					pinIndicator = "📌 "
+					pinIndicator = pinText()
 				}
 			} else {
-				if isPinned, _ := currentFolder.IsPinnedInFolder(chat.ID); isPinned {
-					pinIndicator = "📌 "
+				if isPinned, _ := currentFolder.IsPinnedInFolder(chat.Peer); isPinned {
+					pinIndicator = pinText()
 				}
 			}
 
@@ -889,11 +987,7 @@ func (m *Model) renderFolderTabs() string {
 	var tabs []string
 
 	for i, folder := range m.state.Folders {
-		name := folder.DisplayName()
-		// Truncate long names
-		if len(name) > 15 {
-			name = name[:14] + "…"
-		}
+		name := truncateFolderName(folder.DisplayName(), 15)
 
 		if i == m.state.SelectedFolder {
 			tabs = append(tabs, TabActiveStyle.Render(name))
@@ -903,6 +997,24 @@ func (m *Model) renderFolderTabs() string {
 	}
 
 	return strings.Join(tabs, TabSeparator.String())
+}
+
+func truncateFolderName(name string, maxRunes int) string {
+	runes := []rune(name)
+	if len(runes) <= maxRunes {
+		return name
+	}
+	if maxRunes <= 1 {
+		return string(runes[:maxRunes])
+	}
+	return string(runes[:maxRunes-1]) + "…"
+}
+
+func initialUploadPercent(total int64) float64 {
+	if total == 0 {
+		return 100
+	}
+	return 0
 }
 
 // viewSending renders the sending screen
@@ -982,10 +1094,9 @@ func (m *Model) updateSending(msg tea.Msg) (*Model, tea.Cmd) {
 		switch msg.String() {
 		case "esc", "ctrl+c":
 			// Cancel upload
-			close(m.cancelUpload)
-			m.state.Screen = ScreenResult
-			m.state.Success = false
-			m.state.ErrorMsg = "Upload cancelled by user"
+			if m.sendCancel != nil {
+				m.sendCancel()
+			}
 			return m, nil
 		}
 	case progress.FrameMsg:
@@ -1011,7 +1122,7 @@ func (m *Model) viewResult() string {
 	}
 
 	s.WriteString("\n\n")
-	s.WriteString(HelpStyle.Render("Press Enter or q to exit"))
+	s.WriteString(HelpStyle.Render("Press Enter or Esc to exit"))
 
 	return s.String()
 }

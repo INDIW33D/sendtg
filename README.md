@@ -67,10 +67,10 @@ sendtg ~/Downloads/photo.jpg
 
 ### Controls
 
-- **↑/↓** or **k/j** - Navigate through folders/chats
-- **Enter** - Select folder or send file to selected chat
-- **Esc** - Go back / Exit
-- **q** - Quit the application
+- **↑/↓** - Navigate through chats
+- **←/→** or **Tab/Shift+Tab** - Switch folders
+- **Enter** - Send the file to the selected chat
+- **Esc** - Clear search, cancel upload, or exit the application
 
 ## Project Structure
 
@@ -128,4 +128,3 @@ This project follows Clean Architecture principles:
 ## License
 
 MIT License
-

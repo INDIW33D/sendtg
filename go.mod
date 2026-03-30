@@ -1,6 +1,6 @@
 module sendtg
 
-go 1.25
+go 1.25.0
 
 require (
 	github.com/charmbracelet/bubbles v0.21.0
@@ -28,6 +28,7 @@ require (
 	github.com/go-faster/xor v1.0.0 // indirect
 	github.com/go-faster/yaml v0.4.6 // indirect
 	github.com/google/uuid v1.6.0 // indirect
+	github.com/gotd/contrib v0.21.1 // indirect
 	github.com/gotd/ige v0.2.2 // indirect
 	github.com/gotd/neo v0.1.5 // indirect
 	github.com/klauspost/compress v1.18.2 // indirect
@@ -57,6 +58,7 @@ require (
 	golang.org/x/sync v0.19.0 // indirect
 	golang.org/x/sys v0.38.0 // indirect
 	golang.org/x/text v0.32.0 // indirect
+	golang.org/x/time v0.15.0 // indirect
 	golang.org/x/tools v0.39.0 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	rsc.io/qr v0.2.0 // indirect

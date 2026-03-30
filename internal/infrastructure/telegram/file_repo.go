@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/gotd/td/telegram/uploader"
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 
 	"sendtg/internal/domain/entity"
 )
@@ -66,9 +68,12 @@ func (p *uploadProgress) Chunk(ctx context.Context, state uploader.ProgressState
 		speed = float64(state.Uploaded) / elapsed
 	}
 
-	percent := float64(state.Uploaded) / float64(p.total) * 100
-	if percent > 100 {
-		percent = 100
+	percent := 100.0
+	if p.total > 0 {
+		percent = float64(state.Uploaded) / float64(p.total) * 100
+		if percent > 100 {
+			percent = 100
+		}
 	}
 
 	if p.progressChan != nil {
@@ -87,14 +92,24 @@ func (p *uploadProgress) Chunk(ctx context.Context, state uploader.ProgressState
 	return nil
 }
 
-// SendFile sends a file to a specific chat
-func (r *FileRepository) SendFile(chatID int64, filePath string) error {
+// SendFile sends a file to a specific chat.
+func (r *FileRepository) SendFile(ctx context.Context, chat entity.Chat, filePath string) error {
 	api := r.client.GetAPI()
 	if api == nil {
 		return fmt.Errorf("client not initialized")
 	}
 
-	ctx := r.client.GetContext()
+	if chat.Peer.IsZero() {
+		return fmt.Errorf("chat peer is not initialized")
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, uploadOperationTimeout)
+	defer cancel()
+
+	peer, err := r.inputPeerForPeer(ctx, chat.Peer)
+	if err != nil {
+		return fmt.Errorf("failed to build input peer: %w", err)
+	}
 
 	// Get the absolute path
 	absPath, err := filepath.Abs(filePath)
@@ -120,99 +135,171 @@ func (r *FileRepository) SendFile(chatID int64, filePath string) error {
 	// Upload file
 	uploaded, err := u.FromPath(ctx, absPath)
 	if err != nil {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return ctx.Err()
+		}
 		return fmt.Errorf("failed to upload file: %w", err)
 	}
 
-	// Resolve the peer - we need to get access hash for users
-	peer, err := r.resolvePeer(chatID)
+	err = r.sendUploadedFile(ctx, api, peer, uploaded, fileInfo.Name())
 	if err != nil {
-		return fmt.Errorf("failed to resolve peer: %w", err)
-	}
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return ctx.Err()
+		}
+		if !isRetryablePeerError(err) {
+			return fmt.Errorf("failed to send file: %w", err)
+		}
 
-	// Create document
-	doc := &tg.InputMediaUploadedDocument{
-		File:     uploaded,
-		MimeType: getMimeType(fileInfo.Name()),
-		Attributes: []tg.DocumentAttributeClass{
-			&tg.DocumentAttributeFilename{
-				FileName: fileInfo.Name(),
-			},
-		},
-	}
+		freshPeerRef, refreshErr := r.refreshPeerFromDialogs(ctx, chat.Peer)
+		if refreshErr != nil {
+			return fmt.Errorf("failed to refresh peer after send error: %v (refresh failed: %w)", err, refreshErr)
+		}
 
-	// Send message
-	_, err = api.MessagesSendMedia(ctx, &tg.MessagesSendMediaRequest{
-		Peer:     peer,
-		Media:    doc,
-		Message:  "",
-		RandomID: generateRandomID(),
-	})
-	if err != nil {
-		return fmt.Errorf("failed to send file: %w", err)
+		peer, refreshErr = r.inputPeerForPeer(ctx, freshPeerRef)
+		if refreshErr != nil {
+			return fmt.Errorf("failed to rebuild refreshed input peer: %w", refreshErr)
+		}
+
+		if retryErr := r.sendUploadedFile(ctx, api, peer, uploaded, fileInfo.Name()); retryErr != nil {
+			if errors.Is(ctx.Err(), context.Canceled) {
+				return ctx.Err()
+			}
+			return fmt.Errorf("failed to send file after peer refresh: %w", retryErr)
+		}
 	}
 
 	return nil
 }
 
-// resolvePeer resolves a chat ID to an InputPeer with access hash
-func (r *FileRepository) resolvePeer(chatID int64) (tg.InputPeerClass, error) {
-	api := r.client.GetAPI()
-	ctx := r.client.GetContext()
-
-	// First try to get the user from dialogs
-	req := &tg.MessagesGetDialogsRequest{
-		OffsetDate: 0,
-		OffsetID:   0,
-		OffsetPeer: &tg.InputPeerEmpty{},
-		Limit:      100,
-		Hash:       0,
+func (r *FileRepository) sendUploadedFile(ctx context.Context, api *tg.Client, peer tg.InputPeerClass, uploaded tg.InputFileClass, fileName string) error {
+	doc := &tg.InputMediaUploadedDocument{
+		File:     uploaded,
+		MimeType: getMimeType(fileName),
+		Attributes: []tg.DocumentAttributeClass{
+			&tg.DocumentAttributeFilename{FileName: fileName},
+		},
 	}
 
-	result, err := api.MessagesGetDialogs(ctx, req)
-	if err != nil {
-		return &tg.InputPeerUser{UserID: chatID}, nil
-	}
+	sendCtx, cancel := context.WithTimeout(ctx, sendMediaRPCTimeout)
+	defer cancel()
 
-	switch res := result.(type) {
-	case *tg.MessagesDialogs:
-		return r.findPeerInDialogs(chatID, res.Users, res.Chats)
-	case *tg.MessagesDialogsSlice:
-		return r.findPeerInDialogs(chatID, res.Users, res.Chats)
-	}
-
-	return &tg.InputPeerUser{UserID: chatID}, nil
+	_, err := api.MessagesSendMedia(sendCtx, &tg.MessagesSendMediaRequest{
+		Peer:     peer,
+		Media:    doc,
+		Message:  "",
+		RandomID: generateRandomID(),
+	})
+	return err
 }
 
-// findPeerInDialogs finds the peer with access hash from dialogs
-func (r *FileRepository) findPeerInDialogs(chatID int64, users []tg.UserClass, chats []tg.ChatClass) (tg.InputPeerClass, error) {
-	for _, u := range users {
-		if user, ok := u.(*tg.User); ok {
-			if user.ID == chatID {
-				return &tg.InputPeerUser{
-					UserID:     user.ID,
-					AccessHash: user.AccessHash,
-				}, nil
+func (r *FileRepository) refreshPeerFromDialogs(ctx context.Context, target entity.PeerRef) (entity.PeerRef, error) {
+	api := r.client.GetAPI()
+	if api == nil {
+		return entity.PeerRef{}, fmt.Errorf("client not initialized")
+	}
+
+	targetKey := target.Key()
+	for _, peerFolderID := range []int32{mainPeerFolderID, archivePeerFolderID} {
+		offsetDate := 0
+		offsetID := 0
+		var offsetPeer tg.InputPeerClass = &tg.InputPeerEmpty{}
+		limit := 100
+		loadedDialogs := 0
+
+		for {
+			req := &tg.MessagesGetDialogsRequest{
+				OffsetDate: offsetDate,
+				OffsetID:   offsetID,
+				OffsetPeer: offsetPeer,
+				Limit:      limit,
+				Hash:       0,
 			}
+			if offsetDate != 0 || offsetID != 0 || inputPeerKey(offsetPeer) != "" {
+				req.ExcludePinned = true
+			}
+			if peerFolderID == archivePeerFolderID {
+				req.FolderID = int(archivePeerFolderID)
+			}
+
+			dialogsCtx, cancel := context.WithTimeout(ctx, dialogsRPCTimeout)
+			result, err := api.MessagesGetDialogs(dialogsCtx, req)
+			cancel()
+			if err != nil {
+				return entity.PeerRef{}, err
+			}
+
+			var dialogs []tg.DialogClass
+			var messages []tg.MessageClass
+			var chats []tg.ChatClass
+			var users []tg.UserClass
+			var totalCount int
+
+			switch res := result.(type) {
+			case *tg.MessagesDialogs:
+				dialogs = res.Dialogs
+				messages = res.Messages
+				chats = res.Chats
+				users = res.Users
+				totalCount = len(dialogs)
+			case *tg.MessagesDialogsSlice:
+				dialogs = res.Dialogs
+				messages = res.Messages
+				chats = res.Chats
+				users = res.Users
+				totalCount = res.Count
+			case *tg.MessagesDialogsNotModified:
+				break
+			}
+
+			userMap := buildUserMap(users)
+			channelMap := buildChannelMap(chats)
+			for _, dialogClass := range dialogs {
+				dialog, ok := dialogClass.(*tg.Dialog)
+				if !ok || peerKey(dialog.Peer) != targetKey {
+					continue
+				}
+				if ref, ok := peerRefFromPeer(dialog.Peer, userMap, channelMap); ok {
+					return ref, nil
+				}
+			}
+			loadedDialogs += len(dialogs)
+
+			if len(dialogs) == 0 || len(dialogs) < limit || loadedDialogs >= totalCount {
+				break
+			}
+
+			nextOffsetDate, nextOffsetID, nextOffsetPeer, ok := nextDialogsPageOffset(dialogs, messages, userMap, channelMap)
+			if !ok {
+				break
+			}
+			if nextOffsetDate == offsetDate && nextOffsetID == offsetID && inputPeerKey(nextOffsetPeer) == inputPeerKey(offsetPeer) {
+				break
+			}
+
+			offsetDate = nextOffsetDate
+			offsetID = nextOffsetID
+			offsetPeer = nextOffsetPeer
 		}
 	}
 
-	for _, c := range chats {
-		switch chat := c.(type) {
-		case *tg.Chat:
-			if chat.ID == chatID {
-				return &tg.InputPeerChat{ChatID: chat.ID}, nil
-			}
-		case *tg.Channel:
-			if chat.ID == chatID {
-				return &tg.InputPeerChannel{
-					ChannelID:  chat.ID,
-					AccessHash: chat.AccessHash,
-				}, nil
-			}
+	return entity.PeerRef{}, fmt.Errorf("peer %s not found in dialogs", targetKey)
+}
+
+func (r *FileRepository) inputPeerForPeer(ctx context.Context, peer entity.PeerRef) (tg.InputPeerClass, error) {
+	if peer.Kind == entity.PeerKindUser {
+		selfCtx, cancel := context.WithTimeout(ctx, profileRPCTimeout)
+		defer cancel()
+
+		if selfID, err := r.client.SelfID(selfCtx); err == nil && selfID == peer.ID {
+			return &tg.InputPeerSelf{}, nil
 		}
 	}
 
-	return &tg.InputPeerUser{UserID: chatID}, nil
+	return inputPeerFromPeerRef(peer)
+}
+
+func isRetryablePeerError(err error) bool {
+	return tgerr.Is(err, "PEER_ID_INVALID", "CHANNEL_INVALID", "USER_ID_INVALID")
 }
 
 // getMimeType returns a MIME type based on file extension
